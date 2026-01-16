@@ -201,7 +201,7 @@ function getTermFilter(input: string, cursor: TreeCursor): FilterFn {
     const termFilter = getTermFilter(input.toLowerCase(), cursor);
     cursor.parent();
     return async ({ content }: { content?: string }) =>
-      Boolean(content && termFilter({ content: content.toLowerCase() }));
+      Boolean(content && (await termFilter({ content: content.toLowerCase() })));
   }
 
   if (cursor.node.type.name === "TagOperator") {

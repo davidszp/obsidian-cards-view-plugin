@@ -1,3 +1,40 @@
 /*
  * Required by Obsidian to load the plugin
  */
+
+/* Batch Summarize Modal */
+.cards-view-batch-modal {
+  max-width: 500px;
+}
+
+.cards-view-batch-modal .progress-container {
+  width: 100%;
+  height: 8px;
+  background-color: var(--background-modifier-border);
+  border-radius: 4px;
+  overflow: hidden;
+  margin: 16px 0;
+}
+
+.cards-view-batch-modal .progress-bar {
+  height: 100%;
+  background-color: var(--interactive-accent);
+  transition: width 0.3s ease;
+}
+
+.cards-view-batch-modal .current-file {
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cards-view-batch-modal .batch-stats {
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+}
+
+.cards-view-batch-modal .mod-warning {
+  color: var(--text-warning);
+}

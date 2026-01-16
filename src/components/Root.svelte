@@ -9,6 +9,7 @@
     searchQuery,
     searchCaseSensitive,
     searchResultLoadingState,
+    matchingNotesCount,
     Sort,
     sort,
     settings,
@@ -88,6 +89,9 @@
   let lastLayout: Date = new Date();
   let pendingLayout: NodeJS.Timeout | null = null;
   const debouncedLayout = () => {
+    // Guard against calling before onMount initializes notesGrid
+    if (!notesGrid) return Promise.resolve();
+
     // If there has been a relayout call in the last 200ms,
     // we schedule another one 100ms later to avoid layout thrashing
     return new Promise<void>((resolve, reject) => {
@@ -128,6 +132,13 @@
     onclick={sortMenu}
     aria-label="Sort"
   ></button>
+  <span class="notes-count">
+    {#if $searchResultLoadingState < 1}
+      Searching...
+    {:else}
+      {$matchingNotesCount} notes
+    {/if}
+  </span>
   <div class="action-bar__search">
     <div class="search-input-container">
       <input
@@ -215,6 +226,14 @@
     @media screen and (min-width: 700px) {
       flex-wrap: nowrap;
     }
+  }
+
+  .action-bar .notes-count {
+    color: var(--text-muted);
+    font-size: var(--font-ui-small);
+    white-space: nowrap;
+    display: flex;
+    align-items: center;
   }
 
   .action-bar .action-bar__tags {

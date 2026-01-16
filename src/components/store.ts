@@ -16,217 +16,292 @@ export enum Sort {
 }
 
 /**
- * Stores for obsidian data (updated mainly from main.ts)
+ * Core stores for obsidian data (set from main.ts)
  */
-
 export const app = writable<App>();
 export const view = writable<ItemView>();
 export const appCache = writable<MetadataCache>();
 export const files = writable<TFile[]>([]);
 
 /**
- * Stores for user input (updated mainly from settings.ts, view.ts, Root.svelte)
+ * User input stores
  */
-
 export const settings = writable<CardsViewSettings>();
 export const sort = writable<Sort>(Sort.Modified);
-const pinnedFiles = derived(settings, ($settings) => $settings?.pinnedFiles);
+export const searchQuery = writable<string>("");
+export const searchCaseSensitive = writable(false);
+
+/**
+ * Derived: sorted files with pinned files first
+ */
+const pinnedFiles = derived(settings, ($settings) => $settings?.pinnedFiles ?? []);
 const sortedFiles = derived(
   [sort, files, pinnedFiles],
   ([$sort, $files, $pinnedFiles]) =>
     [...$files].sort(
       (a: TFile, b: TFile) =>
-        ($pinnedFiles.includes(b.path) ? 1 : 0) -
-          ($pinnedFiles.includes(a.path) ? 1 : 0) ||
+        (($pinnedFiles?.includes(b.path) ? 1 : 0) -
+          ($pinnedFiles?.includes(a.path) ? 1 : 0)) ||
         b.stat[$sort] - a.stat[$sort],
     ),
   [] as TFile[],
 );
-export const searchQuery = writable<string>("");
-export const searchCaseSensitive = writable(false);
 
 /**
- * Search logic
+ * Derived: the complete search query (base + user input)
  */
-
-const baseQuery = derived(settings, ($settings) => $settings?.baseQuery);
-const searchFilter = derived(
+const baseQuery = derived(settings, ($settings) => $settings?.baseQuery ?? "");
+const fullQuery = derived(
   [baseQuery, searchQuery],
   ([$baseQuery, $searchQuery]) => {
-    const query = $baseQuery ? $baseQuery + " " + $searchQuery : $searchQuery;
+    const base = $baseQuery?.trim() ?? "";
+    const search = $searchQuery?.trim() ?? "";
+    return base ? (search ? `${base} ${search}` : base) : search;
+  },
+);
 
-    if (query === "") {
-      return null;
+// =============================================================================
+// SEARCH STATE MACHINE
+// =============================================================================
+
+interface SearchState {
+  // Which files match the current filter (null = no filter, show all)
+  matchingFiles: Set<TFile> | null;
+  // Progress 0-1, where 1 = complete
+  progress: number;
+  // Current search ID (for cancellation)
+  searchId: number;
+}
+
+const searchState = writable<SearchState>({
+  matchingFiles: null,
+  progress: 1,
+  searchId: 0,
+});
+
+// Cache: query+mtime -> match result
+let filterCache: Map<string, boolean> = new Map();
+let lastQueryForCache = "";
+
+/**
+ * Main search function - processes all files against the current filter
+ */
+async function runSearch() {
+  const $fullQuery = get(fullQuery);
+  const $sortedFiles = get(sortedFiles);
+  const $appCache = get(appCache);
+  const $app = get(app);
+  const $caseSensitive = get(searchCaseSensitive);
+
+  // Get new search ID
+  const currentState = get(searchState);
+  const thisSearchId = currentState.searchId + 1;
+
+  // Clear cache if query changed
+  if ($fullQuery !== lastQueryForCache) {
+    filterCache = new Map();
+    lastQueryForCache = $fullQuery;
+  }
+
+  // No query = show all files
+  if (!$fullQuery) {
+    searchState.set({
+      matchingFiles: null,
+      progress: 1,
+      searchId: thisSearchId,
+    });
+    return;
+  }
+
+  // Initialize: no files match yet, progress 0
+  searchState.set({
+    matchingFiles: new Set(),
+    progress: 0,
+    searchId: thisSearchId,
+  });
+
+  // Check if this search is still current
+  const isStale = () => get(searchState).searchId !== thisSearchId;
+
+  // Guard: app not ready
+  if (!$app || !$appCache) {
+    return;
+  }
+
+  // Generate filter function
+  let filterFn: Awaited<ReturnType<typeof generateFilter>>;
+  try {
+    filterFn = generateFilter($fullQuery);
+  } catch (e) {
+    console.error("[CardsView] Error parsing query:", e);
+    searchState.update((s) => ({ ...s, progress: 1 }));
+    return;
+  }
+
+  const matches = new Set<TFile>();
+  const cacheKey = (f: TFile) => f.path + "|" + f.stat.mtime;
+
+  for (let i = 0; i < $sortedFiles.length; i++) {
+    if (isStale()) return;
+
+    const file = $sortedFiles[i];
+    const key = cacheKey(file);
+
+    // Check cache first
+    const cached = filterCache.get(key);
+    if (cached !== undefined) {
+      if (cached) matches.add(file);
+    } else {
+      // Read file and evaluate filter
+      let content = "";
+      let tags: string[] = [];
+      let frontmatter: Record<string, unknown> | undefined;
+
+      try {
+        content = await file.vault.cachedRead(file);
+        const cache = $appCache.getFileCache(file);
+        tags = (getAllTags(cache as CachedMetadata) || []).map((t) =>
+          t.replace(/^#/, ""),
+        );
+        await $app.fileManager.processFrontMatter(file, (fm) => {
+          frontmatter = fm;
+        });
+      } catch (e) {
+        console.error("[CardsView] Error reading file:", file.path, e);
+      }
+
+      if (isStale()) return;
+
+      let match = false;
+      try {
+        match = await filterFn({
+          file,
+          content,
+          tags,
+          frontmatter,
+          caseSensitive: $caseSensitive,
+        });
+      } catch (e) {
+        console.error("[CardsView] Error filtering file:", file.path, e);
+      }
+
+      filterCache.set(key, match);
+      if (match) matches.add(file);
     }
 
-    return generateFilter(query);
+    // Update progress periodically (every 20 files or at end)
+    if (i % 20 === 0 || i === $sortedFiles.length - 1) {
+      if (isStale()) return;
+      searchState.update((s) => ({
+        ...s,
+        matchingFiles: new Set(matches),
+        progress: (i + 1) / $sortedFiles.length,
+      }));
+    }
+  }
+}
+
+// Debounce search to avoid rapid re-runs
+let searchTimeout: ReturnType<typeof setTimeout> | null = null;
+function triggerSearch() {
+  if (searchTimeout) clearTimeout(searchTimeout);
+  searchTimeout = setTimeout(() => {
+    runSearch();
+  }, 50);
+}
+
+// Subscribe to changes that should trigger a search
+fullQuery.subscribe(triggerSearch);
+files.subscribe(triggerSearch);
+searchCaseSensitive.subscribe(triggerSearch);
+
+// =============================================================================
+// DISPLAY STATE
+// =============================================================================
+
+/**
+ * Filtered files based on search state
+ */
+const filteredFiles = derived(
+  [sortedFiles, searchState],
+  ([$sortedFiles, $searchState]) => {
+    if ($searchState.matchingFiles === null) {
+      return $sortedFiles;
+    }
+    return $sortedFiles.filter((f) => $searchState.matchingFiles!.has(f));
   },
 );
 
 /**
- * This cache is used to avoid re-evaluating the search filter for the same file when some files are updated
- * but the search query has not changed.
+ * Count of matching notes
  */
-let searchResultCache: Map<string, boolean> = new Map();
-searchFilter.subscribe(() => (searchResultCache = new Map()));
-const cacheKey = (file: TFile) => file.path + file.stat.mtime;
+export const matchingNotesCount = derived(filteredFiles, ($filtered) => $filtered.length);
 
 /**
- * This is the real data used by display logic to now which files to display
- *
- * updateSearchResults() makes the connection between searchResultCache and searchResultsExcluded
- * This is not derived from searchResultCache because we want incremental update
- * and not full invalidation when cache is invalidated
+ * Loading state (0-1 progress)
  */
-const searchResultsExcluded = writable<Set<TFile>>(new Set());
-export const searchResultLoadingState = writable(1);
+export const searchResultLoadingState = derived(
+  searchState,
+  ($state) => $state.progress,
+);
 
-async function updateSearchResults() {
-  const $sortedFiles = get(sortedFiles);
-  const $searchQuery = get(searchQuery);
-  const $searchFilter = get(searchFilter);
-  const $appCache = get(appCache);
-  const $app = get(app);
-  const $searchCaseSensitive = get(searchCaseSensitive);
-  if ($searchFilter === null) {
-    searchResultsExcluded.set(new Set());
-    searchResultLoadingState.set(1);
-    return;
-  }
+/**
+ * Displayed files (for infinite scroll)
+ */
+export const displayedCount = writable(50);
+export const displayedFiles = derived(
+  [filteredFiles, displayedCount],
+  ([$filtered, $count]) => $filtered.slice(0, $count),
+);
 
-  let batch: Map<TFile, boolean> = new Map();
-  let lastBatch = { date: new Date(), index: 0 };
-  for (let i = 0; i < $sortedFiles.length; i++) {
-    const file = $sortedFiles[i];
-    const cachedResult = searchResultCache.get(cacheKey($sortedFiles[i]));
-    if (cachedResult !== undefined) {
-      batch.set(file, cachedResult);
-    } else {
-      const content = await file.vault.cachedRead(file);
-      const tags = (
-        getAllTags($appCache.getFileCache(file) as CachedMetadata) || []
-      ).map((t) => t.replace(/^#/, ""));
-      let frontmatter;
-      await $app.fileManager.processFrontMatter(file, (fm) => {
-        frontmatter = fm;
-      });
-
-      const match = await $searchFilter({
-        file,
-        content,
-        tags,
-        frontmatter,
-        caseSensitive: $searchCaseSensitive,
-      });
-
-      if ($searchQuery !== get(searchQuery)) return;
-      batch.set(file, match);
-      searchResultCache.set(cacheKey(file), match);
-    }
-
-    if ($searchQuery !== get(searchQuery)) return;
-
-    if (i % 10 === 0) {
-      searchResultLoadingState.set(i / $sortedFiles.length);
-    }
-
-    if (
-      lastBatch.date.getTime() + 500 < new Date().getTime() ||
-      i === $sortedFiles.length - 1
-    ) {
-      searchResultLoadingState.set((i + 1) / $sortedFiles.length);
-      searchResultsExcluded.update((set) => {
-        batch.forEach((match, file) =>
-          match ? set.delete(file) : set.add(file),
-        );
-        return set;
-      });
-      batch = new Map();
-      lastBatch = { date: new Date(), index: i + 1 };
-    }
-  }
+/**
+ * Increase displayed count (for infinite scroll)
+ */
+export function loadMore(count: number = 50) {
+  displayedCount.update((c) => c + count);
 }
-searchFilter.subscribe(() => updateSearchResults());
-files.subscribe(() => updateSearchResults());
-searchCaseSensitive.subscribe(() => updateSearchResults());
 
 /**
- * Display logic
+ * Reset displayed count when filter changes
  */
+filteredFiles.subscribe(() => {
+  displayedCount.set(50);
+});
 
-export const displayedCount = writable(0);
-export const displayedFiles = writable<TFile[]>([]);
-const lastDisplayed = derived(displayedFiles, ($displayedFiles) => {
-  const lastFile = $displayedFiles.last();
-  return lastFile ? get(sortedFiles).indexOf(lastFile) : 0;
-});
-searchResultsExcluded.subscribe((excludedFiles) => {
-  // When the search results changes, and we have less files to display, we want
-  // to keep the same file as current end of infinite scroll
-  // event if it means that we reduce the number of files displayed.
-  // This is to avoid the infinite scroll to be triggered when the user
-  // is typing in search
-  const $sortedFiles = get(sortedFiles);
-  const $lastDisplayed = get(lastDisplayed);
-  const beforeCurrentLast = $sortedFiles.slice(0, $lastDisplayed + 1);
-  const targetLength = Math.max(50, get(displayedFiles).length);
-  const matchingBeforeCurrentLast: TFile[] = [];
-  for (
-    let i = 0;
-    matchingBeforeCurrentLast.length < targetLength &&
-    i < beforeCurrentLast.length;
-    i++
-  ) {
-    if (!excludedFiles.has(beforeCurrentLast[i])) {
-      matchingBeforeCurrentLast.push(beforeCurrentLast[i]);
-    }
-  }
+// =============================================================================
+// SUMMARY CACHE (Foundation for Ollama feature)
+// =============================================================================
 
-  if (matchingBeforeCurrentLast.length >= targetLength) {
-    displayedFiles.set(matchingBeforeCurrentLast);
-    return;
-  }
+export interface CardSummary {
+  text: string;
+  wordCount: number;
+  generatedAt: number;
+}
 
-  // If we have not enough files to reach target length, we add some new ones
-  const toAdd = targetLength - matchingBeforeCurrentLast.length;
-  // If search results are updating, exclude files which have not been filtered yet
-  const afterCurrentLast = $sortedFiles.slice(
-    $lastDisplayed,
-    Math.floor($sortedFiles.length * get(searchResultLoadingState)) -
-      $lastDisplayed -
-      1,
-  );
-  const matchingAfterCurrentLast: TFile[] = [];
-  for (
-    let i = 0;
-    matchingAfterCurrentLast.length < toAdd && i < afterCurrentLast.length;
-    i++
-  ) {
-    if (!excludedFiles.has(afterCurrentLast[i])) {
-      matchingAfterCurrentLast.push(afterCurrentLast[i]);
-    }
-  }
-  displayedFiles.set([
-    ...matchingBeforeCurrentLast,
-    ...matchingAfterCurrentLast.slice(0, toAdd),
-  ]);
-});
-// When the user scrolls, we add more files to the display
-displayedCount.subscribe((count) => {
-  displayedFiles.set(
-    get(sortedFiles)
-      .filter((f) => !get(searchResultsExcluded).has(f))
-      .slice(0, count),
-  );
-});
-// When sort order changes, we want to reset display with same number of files
-sortedFiles.subscribe(($sortedFiles) => {
-  displayedFiles.set(
-    $sortedFiles
-      .filter((f) => !get(searchResultsExcluded).has(f))
-      .slice(0, get(displayedFiles).length),
-  );
-});
+// In-memory cache of summaries (frontmatter is source of truth)
+export const summaryCache = writable<Map<string, CardSummary>>(new Map());
+
+/**
+ * Get summary for a file from cache or frontmatter
+ */
+export function getSummary(file: TFile): CardSummary | null {
+  const cache = get(summaryCache);
+  return cache.get(file.path) ?? null;
+}
+
+/**
+ * Store summary in cache (and optionally in frontmatter via separate function)
+ */
+export function cacheSummary(file: TFile, summary: CardSummary) {
+  summaryCache.update((cache) => {
+    cache.set(file.path, summary);
+    return cache;
+  });
+}
+
+// =============================================================================
+// EXPORTS
+// =============================================================================
 
 export default {
   files,
@@ -239,4 +314,5 @@ export default {
   view,
   settings,
   appCache,
+  loadMore,
 };

@@ -3,14 +3,17 @@
     type MarkdownPostProcessorContext,
     MarkdownPreviewRenderer,
     MarkdownRenderer,
+    Menu,
+    Notice,
     setIcon,
     TFile,
   } from "obsidian";
   import { onMount } from "svelte";
   import { fade } from "svelte/transition";
   import { app, view, settings } from "./store";
-  import { TitleDisplayMode } from "../settings";
+  import { TitleDisplayMode, CardDisplayMode, SummaryStyle } from "../settings";
   import { extractPreviewContent } from "../utils/previewContent";
+  import { getOllamaService } from "../services/ollama";
 
   interface Props {
     file: TFile;
@@ -23,6 +26,11 @@
   // This will depend both on the settings and the content of the file
   let displayFilename: boolean = $state(true);
   let translateTransition: boolean = $state(false);
+
+  // Summary-related state
+  let summaryText: string | null = $state(null);
+  let displayMode: "full" | "summary" = $state("full");
+  let isGeneratingSummary: boolean = $state(false);
 
   function postProcessor(
     element: HTMLElement,
@@ -67,7 +75,116 @@
     }
   }
 
+  const loadSummaryData = async () => {
+    if (!$settings.enableSummaries) {
+      displayMode = "full";
+      return;
+    }
+
+    const ollama = getOllamaService($app, $settings);
+
+    // Check frontmatter for display preference
+    const fmDisplayMode = await ollama.getDisplayModeFromFrontmatter(file);
+    displayMode = fmDisplayMode ?? $settings.defaultDisplayMode;
+
+    // Load existing summary
+    summaryText = await ollama.getSummaryFromFrontmatter(file);
+  };
+
+  const generateSummary = async (e: Event) => {
+    e.stopPropagation();
+    e.preventDefault();
+
+    if (!$settings.enableSummaries || isGeneratingSummary) return;
+
+    isGeneratingSummary = true;
+    const ollama = getOllamaService($app, $settings);
+
+    // Check if Ollama is available
+    const available = await ollama.isAvailable();
+    if (!available) {
+      new Notice(`Cannot connect to Ollama at ${$settings.ollamaEndpoint}`);
+      isGeneratingSummary = false;
+      return;
+    }
+
+    try {
+      const result = await ollama.summarizeFile(file);
+      if (result) {
+        summaryText = result.summary;
+        new Notice(`Summary generated (${result.wordCount} words)`);
+      } else {
+        new Notice("Failed to generate summary");
+      }
+    } catch (err) {
+      console.error("[CardsView] Summary error:", err);
+      new Notice(`Summary error: ${err}`);
+    }
+
+    isGeneratingSummary = false;
+    await updateLayoutNextTick();
+  };
+
+  const toggleDisplayMode = async (e: Event) => {
+    e.stopPropagation();
+    e.preventDefault();
+
+    const newMode = displayMode === "full" ? "summary" : "full";
+    displayMode = newMode;
+
+    // Save preference to frontmatter
+    const ollama = getOllamaService($app, $settings);
+    await ollama.setDisplayModeInFrontmatter(file, newMode);
+    await updateLayoutNextTick();
+  };
+
+  const showSummaryContextMenu = (e: MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+
+    const menu = new Menu();
+
+    menu.addItem((item) => {
+      item
+        .setTitle("Delete summary")
+        .setIcon("trash")
+        .onClick(async () => {
+          // Remove summary from frontmatter
+          const { summaryFrontmatterKey } = $settings;
+          await $app.fileManager.processFrontMatter(file, (fm) => {
+            delete fm[summaryFrontmatterKey];
+          });
+
+          summaryText = null;
+          displayMode = "full";
+          new Notice("Summary deleted");
+          await updateLayoutNextTick();
+        });
+    });
+
+    menu.addItem((item) => {
+      item
+        .setTitle("Regenerate summary")
+        .setIcon("refresh-cw")
+        .onClick(async () => {
+          // Delete first, then regenerate
+          const { summaryFrontmatterKey } = $settings;
+          await $app.fileManager.processFrontMatter(file, (fm) => {
+            delete fm[summaryFrontmatterKey];
+          });
+
+          summaryText = null;
+          await generateSummary(e);
+        });
+    });
+
+    menu.showAtMouseEvent(e);
+  };
+
   const renderFile = async (el: HTMLElement): Promise<void> => {
+    // Load summary data first
+    await loadSummaryData();
+
     const fullContent = await file.vault.cachedRead(file);
     const previewContent = extractPreviewContent(fullContent);
     MarkdownPreviewRenderer.registerPostProcessor(postProcessor);
@@ -97,6 +214,9 @@
   const pinButton = (element: HTMLElement) => setIcon(element, "pin");
   const trashIcon = (element: HTMLElement) => setIcon(element, "trash");
   const folderIcon = (element: HTMLElement) => setIcon(element, "folder");
+  const sparklesIcon = (element: HTMLElement) => setIcon(element, "sparkles");
+  const eyeIcon = (element: HTMLElement) => setIcon(element, "eye");
+  const fileTextIcon = (element: HTMLElement) => setIcon(element, "file-text");
 
   onMount(() => {
     (async () => {
@@ -117,8 +237,16 @@
   onkeydown={openFile}
   tabindex="0"
 >
-  {#if displayFilename}<h1>{file.basename}</h1>{/if}
-  <div class="card-content" bind:this={contentDiv}></div>
+  {#if ($settings.enableSummaries && displayMode === "summary" && summaryText) || displayFilename}<h1>{file.basename}</h1>{/if}
+
+  {#if $settings.enableSummaries && displayMode === "summary" && summaryText}
+    <div class="card-content card-summary" class:italics={$settings.summaryStyle === SummaryStyle.Italics}>
+      <p>{summaryText}</p>
+    </div>
+  {:else}
+    <div class="card-content" bind:this={contentDiv}></div>
+  {/if}
+
   <div class="card-info">
     <button
       class="clickable-icon"
@@ -127,6 +255,28 @@
       onclick={togglePin}
       aria-label="Pin file"
     ></button>
+
+    {#if $settings.enableSummaries}
+      {#if summaryText}
+        <button
+          class="clickable-icon"
+          class:is-active={displayMode === "summary"}
+          use:eyeIcon
+          onclick={toggleDisplayMode}
+          oncontextmenu={showSummaryContextMenu}
+          aria-label={displayMode === "summary" ? "Show full content" : "Show summary"}
+        ></button>
+      {:else}
+        <button
+          class="clickable-icon"
+          class:is-loading={isGeneratingSummary}
+          use:sparklesIcon
+          onclick={generateSummary}
+          aria-label="Generate summary"
+        ></button>
+      {/if}
+    {/if}
+
     {#if file.parent != null && file.parent.path !== "/"}
       <div class="folder-name">
         <span use:folderIcon></span>{file.parent.path}
@@ -274,5 +424,28 @@
     justify-content: center;
     gap: var(--size-4-1);
     color: var(--text-muted);
+  }
+
+  .card .card-summary {
+    color: var(--text-muted);
+  }
+
+  .card .card-summary.italics {
+    font-style: italic;
+  }
+
+  .card .card-info .clickable-icon.is-loading {
+    opacity: 0.5;
+    animation: pulse 1.5s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%,
+    100% {
+      opacity: 0.5;
+    }
+    50% {
+      opacity: 1;
+    }
   }
 </style>
